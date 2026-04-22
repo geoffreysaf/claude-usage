@@ -24,14 +24,21 @@ Status colour is driven by the higher of the two values: green below 70%, amber 
 ```bash
 brew install --cask swiftbar
 mkdir -p ~/SwiftBar
-cp claude-usage.5m.sh ~/SwiftBar/
-chmod +x ~/SwiftBar/claude-usage.5m.sh
+curl -fsSL https://raw.githubusercontent.com/geoffreysaf/claude-usage/main/claude-usage.5m.sh -o ~/SwiftBar/claude-usage.5m.sh && chmod +x ~/SwiftBar/claude-usage.5m.sh
 open -a SwiftBar
 ```
 
 On first launch SwiftBar asks you to pick a plugin folder — choose `~/SwiftBar`.
 
 For xbar, drop the script in `~/Library/Application Support/xbar/plugins/` instead.
+
+## Update
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/geoffreysaf/claude-usage/main/claude-usage.5m.sh -o ~/SwiftBar/claude-usage.5m.sh && chmod +x ~/SwiftBar/claude-usage.5m.sh
+```
+
+Then right-click the SwiftBar menubar icon → **Refresh All**.
 
 The filename's `.5m.` part tells SwiftBar/xbar to refresh every 5 minutes.
 
