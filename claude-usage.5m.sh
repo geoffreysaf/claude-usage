@@ -6,18 +6,34 @@
 #   - OAuth token is never written to disk and never appears in process argv
 #     (passed via curl --config on stdin heredoc).
 #   - Reads token via /usr/bin/security, same path Claude Code itself uses.
-#   - No telemetry, no update checks, no logs, no AppleScript, no file writes
-#     other than a single-line mode file at ~/.config/claude-usage/mode (0600).
+#   - No telemetry, no update checks, no logs, no AppleScript.
+#   - Writes only:
+#       ~/.config/claude-usage/mode   (4 bytes, "pct" or "time")
+#       ~/.cache/claude-usage/last.json  (last good API response + timestamp)
+#     Both are 0600.
 #   - Exits 0 on all error paths so SwiftBar renders cleanly.
 #
-# Requires: macOS, python3 (ships with Xcode Command Line Tools), curl.
+# Rate-limit handling:
+#   - Anthropic's /api/oauth/usage is rate-limited per account. To avoid
+#     digging a hole, we serve cached values when the API 429s and skip
+#     calling the API more than once every MIN_CALL_INTERVAL seconds.
+#
+# Requires: macOS, python3 (Xcode Command Line Tools), curl.
 
 set -u
 umask 077
 
 MODE_FILE="$HOME/.config/claude-usage/mode"
+CACHE_DIR="$HOME/.cache/claude-usage"
+CACHE_FILE="$CACHE_DIR/last.json"
 DEFAULT_MODE="pct"
 PYTHON_BIN="/usr/bin/python3"
+
+# Don't hit the API more often than this (seconds). SwiftBar polls every 5 min;
+# this extra guard protects against manual refresh spam.
+MIN_CALL_INTERVAL=240
+# Cached values shown as "stale" up to this age on API failure (seconds).
+CACHE_FALLBACK_MAX_AGE=3600
 
 # ---- toggle subcommand (invoked from the dropdown) --------------------------
 if [[ "${1:-}" == "toggle" ]]; then
@@ -32,12 +48,89 @@ if [[ "${1:-}" == "toggle" ]]; then
 fi
 
 # ---- render mode -----------------------------------------------------------
-mkdir -p "$(dirname "$MODE_FILE")"
+mkdir -p "$(dirname "$MODE_FILE")" "$CACHE_DIR"
 mode="$(tr -d '[:space:]' < "$MODE_FILE" 2>/dev/null || printf '%s' "$DEFAULT_MODE")"
 [[ "$mode" != "pct" && "$mode" != "time" ]] && mode="$DEFAULT_MODE"
 other_mode="$([[ "$mode" == "pct" ]] && printf 'time' || printf 'pct')"
 
-render_error() {
+now_epoch() { date +%s; }
+
+# ---- helpers to format + render --------------------------------------------
+# Args: title_emoji sess_pct sess_reset week_pct week_reset [footnote]
+render_values() {
+    local emoji="$1" sp="$2" sr="$3" wp="$4" wr="$5" note="${6:-}"
+    if [[ "$mode" == "pct" ]]; then
+        printf '%s %s%% / %s%%\n' "$emoji" "$sp" "$wp"
+    else
+        printf '%s %s / %s\n' "$emoji" "$sr" "$wr"
+    fi
+    printf -- '---\n'
+    printf 'Session (5h): %s%%  ·  resets in %s\n' "$sp" "$sr"
+    printf 'Weekly  (7d): %s%%  ·  resets in %s\n' "$wp" "$wr"
+    if [[ -n "$note" ]]; then
+        printf -- '---\n'
+        printf '%s\n' "$note"
+    fi
+    printf -- '---\n'
+    printf 'Showing: %s — click to show %s | bash="%s" param1=toggle terminal=false refresh=true\n' \
+        "$mode" "$other_mode" "$0"
+    printf 'Refresh | refresh=true\n'
+    exit 0
+}
+
+# Parse cache and render. Arg: note-to-show ("" for none)
+render_from_cache() {
+    local note="$1"
+    [[ -r "$CACHE_FILE" ]] || render_error_raw "⚠️" "$note (no cached data yet)"
+
+    local parsed
+    parsed="$("$PYTHON_BIN" - "$CACHE_FILE" <<'PY'
+import json, sys, time
+from datetime import datetime, timezone
+
+with open(sys.argv[1]) as f:
+    cache = json.load(f)
+
+age = int(time.time() - cache.get("ts", 0))
+d = cache.get("data") or {}
+
+def fmt(iso):
+    if not iso: return "-"
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except Exception:
+        return "-"
+    secs = int((t - datetime.now(timezone.utc)).total_seconds())
+    if secs <= 0: return "soon"
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    if days:  return f"{days}d{hours}h"
+    if hours: return f"{hours}h{mins}m"
+    return f"{mins}m"
+
+s = d.get("five_hour") or {}
+w = d.get("seven_day") or {}
+print(age,
+      int(s.get("utilization", 0)), fmt(s.get("resets_at")),
+      int(w.get("utilization", 0)), fmt(w.get("resets_at")))
+PY
+)"
+    [[ -z "$parsed" ]] && render_error_raw "⚠️" "$note (cache unreadable)"
+
+    local age sp sr wp wr
+    read -r age sp sr wp wr <<< "$parsed"
+
+    if (( age > CACHE_FALLBACK_MAX_AGE )); then
+        render_error_raw "⚠️" "$note (cache too old: ${age}s)"
+    fi
+
+    # Always yellow tint when serving stale data, regardless of values.
+    local age_min=$(( age / 60 ))
+    render_values "⏳" "$sp" "$sr" "$wp" "$wr" "${note} — cached ${age_min}m ago"
+}
+
+render_error_raw() {
     local title="$1" detail="$2"
     printf '%s\n' "$title"
     printf -- '---\n'
@@ -49,9 +142,26 @@ render_error() {
     exit 0
 }
 
-# Preflight: python3 must exist (ships with Xcode Command Line Tools).
+# If an error occurs, try cache first, fall through to raw error.
+render_error() {
+    render_from_cache "$1"  # exits if cache is usable
+    render_error_raw "⚠️" "$1"
+}
+
+# Preflight: python3 must exist.
 if ! "$PYTHON_BIN" -c 'import json' >/dev/null 2>&1; then
-    render_error "❌" "python3 not available — run: xcode-select --install"
+    render_error_raw "❌" "python3 not available — run: xcode-select --install"
+fi
+
+# ---- self-rate-limit: skip API call if last attempt was very recent --------
+LAST_CALL_FILE="$CACHE_DIR/last_call_ts"
+if [[ -r "$LAST_CALL_FILE" ]]; then
+    last_call="$(cat "$LAST_CALL_FILE" 2>/dev/null || echo 0)"
+    since=$(( $(now_epoch) - last_call ))
+    if (( since < MIN_CALL_INTERVAL )); then
+        render_from_cache "Throttled locally (last call ${since}s ago)"
+        # if cache missing it falls through below and returns an error
+    fi
 fi
 
 # ---- 1. pull OAuth credentials blob from keychain --------------------------
@@ -60,7 +170,7 @@ if [[ -z "$KC_BLOB" ]]; then
     KC_BLOB="$(/usr/bin/security find-generic-password -s 'Claude Code' -w 2>/dev/null || true)"
 fi
 if [[ -z "$KC_BLOB" ]]; then
-    render_error "⚪" "Not signed in — run \`claude\` in Terminal."
+    render_error_raw "⚪" "Not signed in — run \`claude\` in Terminal."
 fi
 
 ACCESS_TOKEN="$(printf '%s' "$KC_BLOB" | "$PYTHON_BIN" -c '
@@ -74,37 +184,50 @@ except Exception:
 unset KC_BLOB
 
 if [[ -z "$ACCESS_TOKEN" ]]; then
-    render_error "⚪" "No OAuth token in keychain — run \`claude\`."
+    render_error_raw "⚪" "No OAuth token in keychain — run \`claude\`."
 fi
 
 # ---- 2. call usage endpoint (token via stdin config, never argv) -----------
 RESP_FILE="$(mktemp -t claude-usage)"
 trap 'rm -f "$RESP_FILE"' EXIT INT TERM HUP
 
-# curl --config reads key = value lines; values are literal when unquoted,
-# which avoids C-escape parsing (safer for opaque tokens).
+# Record attempt timestamp so we self-throttle aggressive refreshes.
+now_epoch > "$LAST_CALL_FILE"
+
 HTTP_CODE="$(
     /usr/bin/curl -sS -o "$RESP_FILE" -w '%{http_code}' \
         --max-time 10 \
         --config - <<EOF
 url = https://api.anthropic.com/api/oauth/usage
-header = Accept: application/json
-header = anthropic-beta: oauth-2025-04-20
-header = User-Agent: claude-code/2.1.0
-header = Authorization: Bearer $ACCESS_TOKEN
+header = "Accept: application/json"
+header = "anthropic-beta: oauth-2025-04-20"
+header = "User-Agent: claude-code/2.1.0"
+header = "Authorization: Bearer $ACCESS_TOKEN"
 EOF
 )"
 unset ACCESS_TOKEN
 
 case "${HTTP_CODE:-000}" in
     200) ;;
-    401) render_error "❌" "Auth expired — run \`claude\` to re-login." ;;
-    429) render_error "⚠️"  "Rate limited — will retry at next refresh." ;;
-    000) render_error "❌" "Network error." ;;
-    *)   render_error "❌" "API error (HTTP $HTTP_CODE)." ;;
+    401) render_error_raw "❌" "Auth expired — run \`claude\` to re-login." ;;
+    429) render_error "Rate limited — showing cached data" ;;
+    000) render_error "Network error — showing cached data" ;;
+    *)   render_error "API error (HTTP $HTTP_CODE) — showing cached data" ;;
 esac
 
-# ---- 3. parse response ------------------------------------------------------
+# ---- 3. on success: update cache then parse --------------------------------
+"$PYTHON_BIN" - "$RESP_FILE" "$CACHE_FILE" <<'PY'
+import json, sys, time, os
+resp_path, cache_path = sys.argv[1], sys.argv[2]
+with open(resp_path) as f:
+    data = json.load(f)
+tmp = cache_path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump({"ts": int(time.time()), "data": data}, f)
+os.chmod(tmp, 0o600)
+os.replace(tmp, cache_path)
+PY
+
 PARSED="$("$PYTHON_BIN" - "$RESP_FILE" <<'PY'
 import json, sys
 from datetime import datetime, timezone
@@ -137,12 +260,12 @@ PY
 )"
 
 if [[ -z "$PARSED" ]]; then
-    render_error "❌" "Could not parse API response."
+    render_error "Could not parse API response"
 fi
 
 read -r SESS_PCT SESS_RESET WEEK_PCT WEEK_RESET <<< "$PARSED"
 
-# ---- 4. pick status colour from worst of the two --------------------------
+# ---- 4. colour from worst bucket -------------------------------------------
 worst="$SESS_PCT"
 (( WEEK_PCT > worst )) && worst="$WEEK_PCT"
 if   (( worst >= 90 )); then EMOJI="🔴"
@@ -150,16 +273,4 @@ elif (( worst >= 70 )); then EMOJI="🟡"
 else                         EMOJI="🟢"
 fi
 
-# ---- 5. render -------------------------------------------------------------
-if [[ "$mode" == "pct" ]]; then
-    printf '%s %s%% / %s%%\n' "$EMOJI" "$SESS_PCT" "$WEEK_PCT"
-else
-    printf '%s %s / %s\n' "$EMOJI" "$SESS_RESET" "$WEEK_RESET"
-fi
-printf -- '---\n'
-printf 'Session (5h): %s%%  ·  resets in %s\n' "$SESS_PCT" "$SESS_RESET"
-printf 'Weekly  (7d): %s%%  ·  resets in %s\n' "$WEEK_PCT" "$WEEK_RESET"
-printf -- '---\n'
-printf 'Showing: %s — click to show %s | bash="%s" param1=toggle terminal=false refresh=true\n' \
-    "$mode" "$other_mode" "$0"
-printf 'Refresh | refresh=true\n'
+render_values "$EMOJI" "$SESS_PCT" "$SESS_RESET" "$WEEK_PCT" "$WEEK_RESET" ""
