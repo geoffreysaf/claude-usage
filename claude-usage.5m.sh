@@ -24,7 +24,16 @@ set -u
 umask 077
 
 MODE_FILE="$HOME/.config/claude-usage/mode"
-CACHE_DIR="$HOME/.cache/claude-usage"
+# Shared cache on iCloud Drive so multiple Macs don't each burn the
+# per-account rate budget on /api/oauth/usage. Falls back to local cache
+# if iCloud Drive is unavailable (e.g. signed out, not yet provisioned).
+ICLOUD_CACHE_DIR="$HOME/Library/Mobile Documents/com~apple~CloudDocs/claude-usage"
+LOCAL_CACHE_DIR="$HOME/.cache/claude-usage"
+if [[ -d "$(dirname "$ICLOUD_CACHE_DIR")" ]]; then
+    CACHE_DIR="$ICLOUD_CACHE_DIR"
+else
+    CACHE_DIR="$LOCAL_CACHE_DIR"
+fi
 CACHE_FILE="$CACHE_DIR/last.json"
 DEFAULT_MODE="pct"
 PYTHON_BIN="/usr/bin/python3"
