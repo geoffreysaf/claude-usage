@@ -20,6 +20,7 @@
 #
 # Requires: macOS, python3 (Xcode Command Line Tools), curl.
 
+set -eo pipefail
 set -u
 umask 077
 
@@ -62,24 +63,9 @@ if [[ "${1:-}" == "toggle" ]]; then
     exit 0
 fi
 
-# ---- render-cache subcommand (invoked by the Refresh menu item) ------------
-# Renders from cache only — never calls the API. Used to prevent menu clicks
-# from burning rate budget.
-# NOTE: render_from_cache + render_error_raw are defined further down;
-# bash resolves function names at call time so this forward reference is fine.
-if [[ "${1:-}" == "render-cache" ]]; then
-    mkdir -p "$(dirname "$MODE_FILE")" "$CACHE_DIR" "$STATE_DIR"
-    mode="$(tr -d '[:space:]' < "$MODE_FILE" 2>/dev/null || printf '%s' "$DEFAULT_MODE")"
-    [[ "$mode" != "pct" && "$mode" != "time" ]] && mode="$DEFAULT_MODE"
-    other_mode="$([[ "$mode" == "pct" ]] && printf 'time' || printf 'pct')"
-    render_from_cache "Cache-only refresh (next API call on SwiftBar's 5-min tick)"
-    # render_from_cache exits on success; if it returns, cache is empty.
-    render_error_raw "⚠️" "No cached data yet — wait for next 5-min refresh"
-fi
-
 # ---- render mode -----------------------------------------------------------
 mkdir -p "$(dirname "$MODE_FILE")" "$CACHE_DIR" "$STATE_DIR"
-mode="$(tr -d '[:space:]' < "$MODE_FILE" 2>/dev/null || printf '%s' "$DEFAULT_MODE")"
+mode="$({ tr -d '[:space:]' < "$MODE_FILE"; } 2>/dev/null || printf '%s' "$DEFAULT_MODE")"
 [[ "$mode" != "pct" && "$mode" != "time" ]] && mode="$DEFAULT_MODE"
 other_mode="$([[ "$mode" == "pct" ]] && printf 'time' || printf 'pct')"
 
@@ -156,7 +142,7 @@ PY
     [[ -z "$parsed" ]] && return 1
 
     local age sp sr wp wr
-    read -r age sp sr wp wr <<< "$parsed"
+    read -r age sp sr wp wr <<< "$parsed" || true
 
     if (( age > CACHE_FALLBACK_MAX_AGE )); then
         return 1
@@ -181,9 +167,22 @@ render_error_raw() {
 
 # If an error occurs, try cache first, fall through to raw error.
 render_error() {
-    render_from_cache "$1"  # exits if cache is usable
-    render_error_raw "⚠️" "$1"
+    # render_from_cache exits on success; returns 1 when cache is unusable.
+    # `if !` keeps set -e from aborting on that expected non-zero.
+    if ! render_from_cache "$1"; then
+        render_error_raw "⚠️" "$1"
+    fi
 }
+
+# ---- render-cache subcommand (invoked by the Refresh menu item) ------------
+# Renders from cache only — never calls the API. Used to prevent menu clicks
+# from burning rate budget. Must live AFTER the function definitions because
+# bash doesn't hoist function bindings.
+if [[ "${1:-}" == "render-cache" ]]; then
+    if ! render_from_cache "Cache-only refresh (next API call on SwiftBar's 5-min tick)"; then
+        render_error_raw "⚠️" "No cached data yet — wait for next 5-min refresh"
+    fi
+fi
 
 # Preflight: python3 must exist.
 if ! "$PYTHON_BIN" -c 'import json' >/dev/null 2>&1; then
@@ -197,10 +196,11 @@ if [[ -r "$NEXT_ALLOWED_FILE" ]]; then
     [[ "$next_allowed" =~ ^[0-9]+$ ]] || next_allowed=0
     if (( now_ts < next_allowed )); then
         wait_for=$(( next_allowed - now_ts ))
-        render_from_cache "Throttled locally (${wait_for}s until next API call)"
-        # render_from_cache returned 1 → no usable cache. Show a clean error
-        # rather than falling through to the API while we're meant to be throttled.
-        render_error_raw "⏳" "Throttled (${wait_for}s remaining, no cache yet)"
+        # render_from_cache exits on success; if it returns, cache is unusable
+        # — show a clean error rather than falling through to the API.
+        if ! render_from_cache "Throttled locally (${wait_for}s until next API call)"; then
+            render_error_raw "⏳" "Throttled (${wait_for}s remaining, no cache yet)"
+        fi
     fi
 fi
 
@@ -231,10 +231,12 @@ fi
 RESP_FILE="$(mktemp -t claude-usage)"
 trap 'rm -f "$RESP_FILE"' EXIT INT TERM HUP
 
+# curl exits non-zero on network failure; swallow so set -e doesn't abort.
+# Empty HTTP_CODE is handled by the "${HTTP_CODE:-000}" default below.
 HTTP_CODE="$(
     /usr/bin/curl -sS -o "$RESP_FILE" -w '%{http_code}' \
         --max-time 10 \
-        --config - <<EOF
+        --config - <<EOF || true
 url = https://api.anthropic.com/api/oauth/usage
 header = "Accept: application/json"
 header = "anthropic-beta: oauth-2025-04-20"
@@ -314,7 +316,7 @@ if [[ -z "$PARSED" ]]; then
     render_error "Could not parse API response"
 fi
 
-read -r SESS_PCT SESS_RESET WEEK_PCT WEEK_RESET <<< "$PARSED"
+read -r SESS_PCT SESS_RESET WEEK_PCT WEEK_RESET <<< "$PARSED" || true
 
 # ---- 4. colour from worst bucket -------------------------------------------
 worst="$SESS_PCT"
