@@ -15,8 +15,8 @@
 #
 # Rate-limit handling:
 #   - Anthropic's /api/oauth/usage is rate-limited per account. To avoid
-#     digging a hole, we serve cached values when the API 429s and skip
-#     calling the API more than once every MIN_CALL_INTERVAL seconds.
+#     digging a hole, we record a next_allowed_ts after every response and
+#     serve cached values when throttled (200→4min, 429→30min, 5xx→15min).
 #
 # Requires: macOS, python3 (Xcode Command Line Tools), curl.
 
@@ -24,9 +24,7 @@ set -u
 umask 077
 
 MODE_FILE="$HOME/.config/claude-usage/mode"
-# Shared cache on iCloud Drive so multiple Macs don't each burn the
-# per-account rate budget on /api/oauth/usage. Falls back to local cache
-# if iCloud Drive is unavailable (e.g. signed out, not yet provisioned).
+# Data cache (last good API response) — may be shared on iCloud across Macs.
 ICLOUD_CACHE_DIR="$HOME/Library/Mobile Documents/com~apple~CloudDocs/claude-usage"
 LOCAL_CACHE_DIR="$HOME/.cache/claude-usage"
 if [[ -d "$(dirname "$ICLOUD_CACHE_DIR")" ]]; then
@@ -35,12 +33,20 @@ else
     CACHE_DIR="$LOCAL_CACHE_DIR"
 fi
 CACHE_FILE="$CACHE_DIR/last.json"
+
+# Throttle state is ALWAYS local — iCloud sync latency caused races.
+STATE_DIR="$LOCAL_CACHE_DIR"
+NEXT_ALLOWED_FILE="$STATE_DIR/next_allowed_ts"
+
 DEFAULT_MODE="pct"
 PYTHON_BIN="/usr/bin/python3"
 
-# Don't hit the API more often than this (seconds). SwiftBar polls every 5 min;
-# this extra guard protects against manual refresh spam.
-MIN_CALL_INTERVAL=240
+# Backoff windows (seconds) applied to NEXT_ALLOWED_FILE after each outcome.
+BACKOFF_OK=240
+BACKOFF_RATE_LIMIT=1800
+BACKOFF_SERVER_ERROR=900
+BACKOFF_NETWORK=600
+
 # Cached values shown as "stale" up to this age on API failure (seconds).
 CACHE_FALLBACK_MAX_AGE=3600
 
@@ -57,12 +63,19 @@ if [[ "${1:-}" == "toggle" ]]; then
 fi
 
 # ---- render mode -----------------------------------------------------------
-mkdir -p "$(dirname "$MODE_FILE")" "$CACHE_DIR"
+mkdir -p "$(dirname "$MODE_FILE")" "$CACHE_DIR" "$STATE_DIR"
 mode="$(tr -d '[:space:]' < "$MODE_FILE" 2>/dev/null || printf '%s' "$DEFAULT_MODE")"
 [[ "$mode" != "pct" && "$mode" != "time" ]] && mode="$DEFAULT_MODE"
 other_mode="$([[ "$mode" == "pct" ]] && printf 'time' || printf 'pct')"
 
 now_epoch() { date +%s; }
+
+# Write next-allowed timestamp (absolute epoch) for the throttle gate.
+# Arg: backoff-in-seconds
+schedule_next_allowed() {
+    local backoff="$1"
+    printf '%s' "$(( $(now_epoch) + backoff ))" > "$NEXT_ALLOWED_FILE"
+}
 
 # ---- helpers to format + render --------------------------------------------
 # Args: title_emoji sess_pct sess_reset week_pct week_reset [footnote]
@@ -162,14 +175,14 @@ if ! "$PYTHON_BIN" -c 'import json' >/dev/null 2>&1; then
     render_error_raw "❌" "python3 not available — run: xcode-select --install"
 fi
 
-# ---- self-rate-limit: skip API call if last attempt was very recent --------
-LAST_CALL_FILE="$CACHE_DIR/last_call_ts"
-if [[ -r "$LAST_CALL_FILE" ]]; then
-    last_call="$(cat "$LAST_CALL_FILE" 2>/dev/null || echo 0)"
-    since=$(( $(now_epoch) - last_call ))
-    if (( since < MIN_CALL_INTERVAL )); then
-        render_from_cache "Throttled locally (last call ${since}s ago)"
-        # if cache missing it falls through below and returns an error
+# ---- self-rate-limit: honour NEXT_ALLOWED_FILE set by prior response --------
+now_ts="$(now_epoch)"
+if [[ -r "$NEXT_ALLOWED_FILE" ]]; then
+    next_allowed="$(cat "$NEXT_ALLOWED_FILE" 2>/dev/null || echo 0)"
+    [[ "$next_allowed" =~ ^[0-9]+$ ]] || next_allowed=0
+    if (( now_ts < next_allowed )); then
+        wait_for=$(( next_allowed - now_ts ))
+        render_from_cache "Throttled locally (${wait_for}s until next API call)"
     fi
 fi
 
@@ -200,9 +213,6 @@ fi
 RESP_FILE="$(mktemp -t claude-usage)"
 trap 'rm -f "$RESP_FILE"' EXIT INT TERM HUP
 
-# Record attempt timestamp so we self-throttle aggressive refreshes.
-now_epoch > "$LAST_CALL_FILE"
-
 HTTP_CODE="$(
     /usr/bin/curl -sS -o "$RESP_FILE" -w '%{http_code}' \
         --max-time 10 \
@@ -217,11 +227,25 @@ EOF
 unset ACCESS_TOKEN
 
 case "${HTTP_CODE:-000}" in
-    200) ;;
-    401) render_error_raw "❌" "Auth expired — run \`claude\` to re-login." ;;
-    429) render_error "Rate limited — showing cached data" ;;
-    000) render_error "Network error — showing cached data" ;;
-    *)   render_error "API error (HTTP $HTTP_CODE) — showing cached data" ;;
+    200)
+        schedule_next_allowed "$BACKOFF_OK"
+        ;;
+    401)
+        # Don't schedule backoff — user needs to re-login, next run should re-check.
+        render_error_raw "❌" "Auth expired — run \`claude\` to re-login."
+        ;;
+    429)
+        schedule_next_allowed "$BACKOFF_RATE_LIMIT"
+        render_error "Rate limited — backing off ${BACKOFF_RATE_LIMIT}s"
+        ;;
+    000)
+        schedule_next_allowed "$BACKOFF_NETWORK"
+        render_error "Network error — backing off ${BACKOFF_NETWORK}s"
+        ;;
+    *)
+        schedule_next_allowed "$BACKOFF_SERVER_ERROR"
+        render_error "API error (HTTP $HTTP_CODE) — backing off ${BACKOFF_SERVER_ERROR}s"
+        ;;
 esac
 
 # ---- 3. on success: update cache then parse --------------------------------

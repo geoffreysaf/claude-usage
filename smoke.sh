@@ -106,4 +106,27 @@ run_case "429 renders cached-or-error" 429 "Rate limited"
 run_case "500 renders error" 500 "API error"
 run_case "network failure renders error" 000 "Network error"
 
+# Backoff persistence: after a 429, a subsequent call within 1800s should throttle.
+rm -rf "$HOME/.cache/claude-usage" "$HOME/.config/claude-usage" "$HOME/Library" 2>/dev/null || true
+mkdir -p "$HOME/.cache" "$HOME/.config" "$HOME/Library/Mobile Documents/com~apple~CloudDocs"
+script_copy="$WORK/claude-usage.sh"
+sed 's|/usr/bin/security|'"$WORK"'/bin/security|g; s|/usr/bin/curl|'"$WORK"'/bin/curl|g' "$SCRIPT" > "$script_copy"
+chmod +x "$script_copy"
+MOCK_HTTP=429 HOME="$HOME" bash "$script_copy" > /dev/null 2>&1 || true
+next="$(cat "$HOME/.cache/claude-usage/next_allowed_ts" 2>/dev/null || echo 0)"
+now="$(date +%s)"
+delta=$(( next - now ))
+if (( delta < 1700 || delta > 1801 )); then
+    printf 'FAIL backoff-persistence — expected ~1800s, got %ss\n' "$delta" >&2
+    exit 1
+fi
+# Second run should throttle — we set MOCK_HTTP=500 and expect NO error bubble
+# (if throttle is working, curl is not called at all).
+out="$(MOCK_HTTP=500 HOME="$HOME" bash "$script_copy" 2>&1 || true)"
+if ! grep -qF "Throttled locally" <<< "$out"; then
+    printf 'FAIL backoff-persistence — second call did not throttle:\n%s\n' "$out" >&2
+    exit 1
+fi
+printf 'PASS backoff-persistence\n'
+
 printf '\nAll smoke cases passed.\n'
