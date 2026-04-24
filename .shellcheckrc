@@ -1,0 +1,4 @@
+# SC2155: declare and assign separately — we accept this for readability
+disable=SC2155
+# SC1091: not following sourced files — we don't source anything, safe
+disable=SC1091
