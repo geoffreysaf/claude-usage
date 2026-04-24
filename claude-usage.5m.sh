@@ -220,7 +220,7 @@ HTTP_CODE="$(
 url = https://api.anthropic.com/api/oauth/usage
 header = "Accept: application/json"
 header = "anthropic-beta: oauth-2025-04-20"
-header = "User-Agent: claude-code/2.1.0"
+header = "User-Agent: claude-usage-swiftbar/1.0 (+https://github.com/geoffreysaf/claude-usage)"
 header = "Authorization: Bearer $ACCESS_TOKEN"
 EOF
 )"
