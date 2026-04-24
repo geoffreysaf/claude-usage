@@ -129,4 +129,36 @@ if ! grep -qF "Throttled locally" <<< "$out"; then
 fi
 printf 'PASS backoff-persistence\n'
 
+# render-cache subcommand must never call curl — we detect by swapping curl
+# with a fatal stub and confirming the script still renders from cache.
+rm -rf "$HOME/.cache/claude-usage" "$HOME/Library" 2>/dev/null || true
+mkdir -p "$HOME/.cache" "$HOME/.config" "$HOME/Library/Mobile Documents/com~apple~CloudDocs"
+# Prime the cache with a 200 response first (use patched copy so stubs work)
+prime_copy="$WORK/claude-usage-prime.sh"
+sed 's|/usr/bin/security|'"$WORK"'/bin/security|g; s|/usr/bin/curl|'"$WORK"'/bin/curl|g' "$SCRIPT" > "$prime_copy"
+chmod +x "$prime_copy"
+MOCK_HTTP=200 HOME="$HOME" bash "$prime_copy" > /dev/null 2>&1
+# Now build a patched copy that has a fatal curl stub in place of /usr/bin/curl
+mkdir -p "$WORK/nocurl"
+cp "$WORK/bin/security" "$WORK/nocurl/security"
+cat > "$WORK/nocurl/curl" <<'STUB'
+#!/bin/bash
+echo "FATAL: curl was called during render-cache" >&2
+exit 99
+STUB
+chmod +x "$WORK/nocurl/curl"
+nocurl_copy="$WORK/claude-usage-nocurl.sh"
+sed 's|/usr/bin/security|'"$WORK"'/nocurl/security|g; s|/usr/bin/curl|'"$WORK"'/nocurl/curl|g' "$SCRIPT" > "$nocurl_copy"
+chmod +x "$nocurl_copy"
+out="$(HOME="$HOME" bash "$nocurl_copy" render-cache 2>&1 || true)"
+if grep -qF "FATAL: curl was called" <<< "$out"; then
+    printf 'FAIL render-cache — invoked curl:\n%s\n' "$out" >&2
+    exit 1
+fi
+if ! grep -qF "42%" <<< "$out"; then
+    printf 'FAIL render-cache — did not render cached 42%% value:\n%s\n' "$out" >&2
+    exit 1
+fi
+printf 'PASS render-cache does not call curl\n'
+
 printf '\nAll smoke cases passed.\n'

@@ -62,6 +62,21 @@ if [[ "${1:-}" == "toggle" ]]; then
     exit 0
 fi
 
+# ---- render-cache subcommand (invoked by the Refresh menu item) ------------
+# Renders from cache only — never calls the API. Used to prevent menu clicks
+# from burning rate budget.
+# NOTE: render_from_cache + render_error_raw are defined further down;
+# bash resolves function names at call time so this forward reference is fine.
+if [[ "${1:-}" == "render-cache" ]]; then
+    mkdir -p "$(dirname "$MODE_FILE")" "$CACHE_DIR" "$STATE_DIR"
+    mode="$(tr -d '[:space:]' < "$MODE_FILE" 2>/dev/null || printf '%s' "$DEFAULT_MODE")"
+    [[ "$mode" != "pct" && "$mode" != "time" ]] && mode="$DEFAULT_MODE"
+    other_mode="$([[ "$mode" == "pct" ]] && printf 'time' || printf 'pct')"
+    render_from_cache "Cache-only refresh (next API call on SwiftBar's 5-min tick)"
+    # render_from_cache exits on success; if it returns, cache is empty.
+    render_error_raw "⚠️" "No cached data yet — wait for next 5-min refresh"
+fi
+
 # ---- render mode -----------------------------------------------------------
 mkdir -p "$(dirname "$MODE_FILE")" "$CACHE_DIR" "$STATE_DIR"
 mode="$(tr -d '[:space:]' < "$MODE_FILE" 2>/dev/null || printf '%s' "$DEFAULT_MODE")"
@@ -96,7 +111,7 @@ render_values() {
     printf -- '---\n'
     printf 'Showing: %s — click to show %s | bash="%s" param1=toggle terminal=false refresh=true\n' \
         "$mode" "$other_mode" "$0"
-    printf 'Refresh | refresh=true\n'
+    printf 'Refresh (cache-only) | bash="%s" param1=render-cache terminal=false refresh=true\n' "$0"
     exit 0
 }
 
@@ -160,7 +175,7 @@ render_error_raw() {
     printf -- '---\n'
     printf 'Toggle display (%s → %s) | bash="%s" param1=toggle terminal=false refresh=true\n' \
         "$mode" "$other_mode" "$0"
-    printf 'Refresh | refresh=true\n'
+    printf 'Refresh (cache-only) | bash="%s" param1=render-cache terminal=false refresh=true\n' "$0"
     exit 0
 }
 
