@@ -118,7 +118,7 @@ render_values() {
 # Parse cache and render. Arg: note-to-show ("" for none)
 render_from_cache() {
     local note="$1"
-    [[ -r "$CACHE_FILE" ]] || render_error_raw "⚠️" "$note (no cached data yet)"
+    [[ -r "$CACHE_FILE" ]] || return 1
 
     local parsed
     parsed="$("$PYTHON_BIN" - "$CACHE_FILE" <<'PY'
@@ -153,13 +153,13 @@ print(age,
       int(w.get("utilization", 0)), fmt(w.get("resets_at")))
 PY
 )"
-    [[ -z "$parsed" ]] && render_error_raw "⚠️" "$note (cache unreadable)"
+    [[ -z "$parsed" ]] && return 1
 
     local age sp sr wp wr
     read -r age sp sr wp wr <<< "$parsed"
 
     if (( age > CACHE_FALLBACK_MAX_AGE )); then
-        render_error_raw "⚠️" "$note (cache too old: ${age}s)"
+        return 1
     fi
 
     # Always yellow tint when serving stale data, regardless of values.
@@ -198,6 +198,9 @@ if [[ -r "$NEXT_ALLOWED_FILE" ]]; then
     if (( now_ts < next_allowed )); then
         wait_for=$(( next_allowed - now_ts ))
         render_from_cache "Throttled locally (${wait_for}s until next API call)"
+        # render_from_cache returned 1 → no usable cache. Show a clean error
+        # rather than falling through to the API while we're meant to be throttled.
+        render_error_raw "⏳" "Throttled (${wait_for}s remaining, no cache yet)"
     fi
 fi
 

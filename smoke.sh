@@ -123,7 +123,7 @@ fi
 # Second run should throttle — we set MOCK_HTTP=500 and expect NO error bubble
 # (if throttle is working, curl is not called at all).
 out="$(MOCK_HTTP=500 HOME="$HOME" bash "$script_copy" 2>&1 || true)"
-if ! grep -qF "Throttled locally" <<< "$out"; then
+if ! grep -qE "Throttled( locally|\s*\()" <<< "$out"; then
     printf 'FAIL backoff-persistence — second call did not throttle:\n%s\n' "$out" >&2
     exit 1
 fi
