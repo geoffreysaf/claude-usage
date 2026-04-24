@@ -161,4 +161,31 @@ if ! grep -qF "42%" <<< "$out"; then
 fi
 printf 'PASS render-cache does not call curl\n'
 
+# Throttled runs must NOT invoke the keychain — wasted work on throttled ticks.
+rm -rf "$HOME/.cache/claude-usage" "$HOME/.config/claude-usage" "$HOME/Library" 2>/dev/null || true
+mkdir -p "$HOME/.cache" "$HOME/.config" "$HOME/Library/Mobile Documents/com~apple~CloudDocs"
+# Prime a backoff by running a 429
+prime429="$WORK/claude-usage-prime429.sh"
+sed 's|/usr/bin/security|'"$WORK"'/bin/security|g; s|/usr/bin/curl|'"$WORK"'/bin/curl|g' "$SCRIPT" > "$prime429"
+chmod +x "$prime429"
+MOCK_HTTP=429 HOME="$HOME" bash "$prime429" > /dev/null 2>&1 || true
+# Replace security with a fatal stub, run again — throttle should skip keychain
+mkdir -p "$WORK/nosec"
+cat > "$WORK/nosec/security" <<'STUB'
+#!/bin/bash
+echo "FATAL: security was called during throttled run" >&2
+exit 99
+STUB
+chmod +x "$WORK/nosec/security"
+cp "$WORK/bin/curl" "$WORK/nosec/curl"
+nosec_copy="$WORK/claude-usage-nosec.sh"
+sed 's|/usr/bin/security|'"$WORK"'/nosec/security|g; s|/usr/bin/curl|'"$WORK"'/nosec/curl|g' "$SCRIPT" > "$nosec_copy"
+chmod +x "$nosec_copy"
+out="$(HOME="$HOME" bash "$nosec_copy" 2>&1 || true)"
+if grep -qF "FATAL: security was called" <<< "$out"; then
+    printf 'FAIL throttled-no-keychain — security was invoked:\n%s\n' "$out" >&2
+    exit 1
+fi
+printf 'PASS throttled runs skip keychain\n'
+
 printf '\nAll smoke cases passed.\n'
