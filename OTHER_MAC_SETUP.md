@@ -59,10 +59,9 @@ Expected: a line like `🟢 12% / 34%` followed by the dropdown content. Errors 
 
 ## How the shared cache works
 
-- `CACHE_DIR` auto-detects iCloud Drive at `~/Library/Mobile Documents/com~apple~CloudDocs/claude-usage/` and falls back to `~/.cache/claude-usage/` if iCloud is unavailable.
-- Both Macs read/write `last.json` and `last_call_ts` there.
-- Self-throttle interval is 240s. If the other Mac called the API within that window, this Mac serves the shared cached values instead of calling.
-- iCloud sync is not instant — expect a few seconds of lag. Occasionally both Macs will make a call within the same window; not a problem, just not perfectly deduped.
+- `last.json` (the data cache) lives at `~/Library/Mobile Documents/com~apple~CloudDocs/claude-usage/` if iCloud Drive is available, falling back to `~/.cache/claude-usage/`. Either Mac's fetch warms it for the other.
+- Throttle state (`next_allowed_ts`) is per-Mac and always local at `~/.cache/claude-usage/`. iCloud sync latency made it unsafe to share.
+- Each Mac enforces its own HTTP-status-aware backoff: 240s on success, 30min on 429, 15min on 5xx, 10min on network failure. Clicking the dropdown's "Refresh (cache-only)" item never calls the API — only SwiftBar's 5-minute filename tick does.
 - The OAuth token is **never** written to the shared cache. It stays in each Mac's keychain.
 
 ## Toggling pct / time display
@@ -71,7 +70,7 @@ The display mode (`pct` vs `time`) is stored per-machine at `~/.config/claude-us
 
 ## Troubleshooting
 
-- **Both Macs stuck on ⏳ (cached) all day**: the iCloud `last_call_ts` is being refreshed by whichever Mac calls first, which suppresses the other. If the API itself is returning 429s, that's upstream rate-limiting — wait it out.
-- **One Mac shows fresh, other shows stale**: normal for the first minute after a fetch, until iCloud syncs.
+- **Both Macs stuck on ⏳ all day**: if you're getting upstream 429s, each Mac backs off for 30 minutes per incident. Either wait it out or delete `~/.cache/claude-usage/next_allowed_ts` on both Macs to retry immediately.
+- **One Mac shows fresh, other shows stale**: normal for the first minute after a fetch, until iCloud syncs the data cache.
 - **`❌ python3 not available`**: run `xcode-select --install`.
 - **`⚪ Not signed in`**: run `claude` in Terminal on this Mac.

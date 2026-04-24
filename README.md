@@ -47,6 +47,8 @@ The filename's `.5m.` part tells SwiftBar/xbar to refresh every 5 minutes.
 Designed so you can audit it in one pass.
 
 - **One outbound domain**: `api.anthropic.com/api/oauth/usage`. Nothing else is contacted.
+- **Conservative backoff**: on HTTP 429 the plugin refuses to call the API for 30 minutes. On 5xx, 15 minutes. On network failure, 10 minutes. Prevents the plugin from compounding an ongoing rate limit.
+- **Cache-only Refresh button**: clicking the dropdown's Refresh item only re-renders from cache. The API is only called on SwiftBar's 5-minute filename-driven tick.
 - **No update checks**, no GitHub API calls at runtime.
 - **OAuth token is never written to disk** and never appears in any process's argv — it's passed to `curl` via stdin config heredoc.
 - **No entitlements required.** Token is read via `/usr/bin/security`, which is already on the Keychain ACL for Claude Code credentials (same pattern Claude Code itself uses).
